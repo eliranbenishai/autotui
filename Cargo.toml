@@ -1,0 +1,26 @@
+[package]
+name = "autotui"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal-based music player for learning and vibing"
+license = "MIT"
+repository = "https://github.com/yourusername/autotui"
+
+[dependencies]
+# Terminal handling
+crossterm = "0.28"
+
+# Low-level audio output
+cpal = "0.15"
+
+# Audio decoding (MP3, FLAC, WAV, OGG, etc.)
+symphonia = { version = "0.5", features = ["mp3", "flac", "ogg", "wav", "pcm"] }
+
+# FFT for spectrum analysis
+rustfft = "6.2"
+
+# Error handling
+anyhow = "1.0"
+
+# For handling file paths
+walkdir = "2.5"
