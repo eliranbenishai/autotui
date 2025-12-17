@@ -7,6 +7,18 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
+# Detect git remote (prefer 'origin', fallback to first available)
+REMOTE=$(git remote | grep -w origin || git remote | head -1)
+if [ -z "$REMOTE" ]; then
+    echo -e "${RED}Error: No git remote configured.${NC}"
+    echo "Add one with: git remote add origin https://github.com/username/autotui.git"
+    exit 1
+fi
+echo -e "${YELLOW}Using remote: ${REMOTE}${NC}"
+
+# Get the default branch
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
 # Get version from argument or prompt
 VERSION=${1:-}
 
@@ -34,7 +46,7 @@ fi
 # Check if tag already exists
 if git rev-parse "$VERSION" >/dev/null 2>&1; then
     echo -e "${RED}Error: Tag ${VERSION} already exists.${NC}"
-    echo "To delete and recreate: git tag -d ${VERSION} && git push origin :refs/tags/${VERSION}"
+    echo "To delete and recreate: git tag -d ${VERSION} && git push ${REMOTE} :refs/tags/${VERSION}"
     exit 1
 fi
 
@@ -53,12 +65,12 @@ git tag -a "$VERSION" -m "Release ${VERSION}"
 echo -e "${GREEN}✓ Created tag ${VERSION}${NC}"
 
 # Push commit and tag
-git push origin main
-git push origin "$VERSION"
-echo -e "${GREEN}✓ Pushed to origin${NC}"
+git push "$REMOTE" "$BRANCH"
+git push "$REMOTE" "$VERSION"
+echo -e "${GREEN}✓ Pushed to ${REMOTE}${NC}"
 
 echo ""
 echo -e "${GREEN}🎉 Release ${VERSION} created!${NC}"
 echo -e "GitHub Actions will now build and publish the release."
-echo -e "Watch progress: ${YELLOW}https://github.com/$(git remote get-url origin | sed 's/.*github.com[:/]\(.*\)\.git/\1/')/actions${NC}"
+echo -e "Watch progress: ${YELLOW}https://github.com/$(git remote get-url "$REMOTE" | sed 's/.*github.com[:/]\(.*\)\.git/\1/')/actions${NC}"
 
