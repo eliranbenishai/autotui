@@ -27,8 +27,9 @@ cargo build --release
 ### Pre-built Binaries
 
 Download from [Releases](https://github.com/yourusername/autotui/releases):
+- `autotui-macos-arm64.tar.gz` — macOS Apple Silicon
 - `autotui-macos-x64.tar.gz` — macOS Intel
-- `autotui-macos-arm64.tar.gz` — macOS Apple Silicon  
+- `autotui-linux-x64.tar.gz` — Linux x64
 - `autotui-windows-x64.zip` — Windows
 
 ## Usage
@@ -96,6 +97,22 @@ rustup target add x86_64-pc-windows-gnu
 brew install mingw-w64
 cargo build --release --target x86_64-pc-windows-gnu
 ```
+
+## Releasing
+
+Create a new release with one command:
+
+```bash
+./release.sh 0.2.0
+# or
+make release V=0.2.0
+```
+
+This will:
+1. Update version in `Cargo.toml`
+2. Commit the version bump
+3. Create and push a git tag
+4. Trigger GitHub Actions to build binaries for all platforms
 
 ## Dependencies
 
