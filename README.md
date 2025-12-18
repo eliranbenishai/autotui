@@ -69,6 +69,27 @@ Create a `.json` file with your track list:
 
 Tracks can be simple path strings or objects with a `path` field. Both local and network paths are supported.
 
+## CLI Arguments
+
+| Argument | Short | Description |
+|----------|-------|-------------|
+| `--folder <PATH>` | `-f` | Directory to scan for audio files (supports network paths) |
+| `--playlist <PATH>` | `-p` | Path to a JSON playlist file |
+| `--help` | `-h` | Print help information |
+| `--version` | `-V` | Print version |
+
+**Examples:**
+
+```bash
+autotui                              # Scan current directory
+autotui -f ~/Music                   # Scan specific folder
+autotui -f "\\server\share\music"   # Windows network path
+autotui -f /Volumes/NAS/Music        # macOS network mount
+autotui -p playlist.json             # Load JSON playlist
+autotui --help                       # Show help
+autotui --version                    # Show version
+```
+
 ## Controls
 
 | Key | Action |
@@ -84,26 +105,6 @@ Tracks can be simple path strings or objects with a `path` field. Both local and
 | `↓` `-` | Volume down |
 | `o` | Rescan current directory |
 | `q` `Esc` | Quit |
-
-## Architecture
-
-```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│  symphonia  │───▶│ Ring Buffer │───▶│    cpal     │
-│  (decoder)  │    │  (samples)  │    │  (output)   │
-└─────────────┘    └──────┬──────┘    └─────────────┘
-                         │
-                         ▼
-                  ┌─────────────┐
-                  │   rustfft   │
-                  │ (spectrum)  │
-                  └─────────────┘
-```
-
-- **symphonia** — Decodes MP3/FLAC/WAV/OGG in a background thread
-- **cpal** — Low-level audio output with direct sample access
-- **rustfft** — 1024-point FFT with Hann windowing for spectrum analysis
-- **Ring buffer** — Lock-free sample transfer between decoder and audio callback
 
 ## Building
 
