@@ -12,6 +12,8 @@ A minimal, single-line terminal music player with real-time spectrum visualizati
 - **Real-time spectrum analyzer** — 16-band FFT visualization that responds to actual audio frequencies
 - **Streaming playback** — instant start, no loading delay
 - **Format support** — MP3, WAV, FLAC, OGG
+- **Network drive support** — play from mapped drives, NAS, or UNC paths
+- **JSON playlists** — load custom playlists from JSON files
 
 ## Installation
 
@@ -37,9 +39,35 @@ Download from [Releases](https://github.com/yourusername/autotui/releases):
 Run `autotui` in a directory containing audio files. It will automatically scan for tracks and start playing.
 
 ```bash
-cd ~/Music
+# Play from current directory
 autotui
+
+# Play from a specific folder (supports network paths)
+autotui --folder ~/Music
+autotui -f "\\server\share\music"      # Windows network path
+autotui -f "/Volumes/NAS/Music"         # macOS network mount
+
+# Play from a JSON playlist
+autotui --playlist my_playlist.json
+autotui -p party_mix.json
 ```
+
+### JSON Playlist Format
+
+Create a `.json` file with your track list:
+
+```json
+{
+  "name": "My Playlist",
+  "tracks": [
+    "/path/to/song1.mp3",
+    "/path/to/song2.flac",
+    { "path": "\\\\server\\share\\song3.mp3" }
+  ]
+}
+```
+
+Tracks can be simple path strings or objects with a `path` field. Both local and network paths are supported.
 
 ## Controls
 
@@ -122,6 +150,8 @@ This will:
 | [cpal](https://github.com/RustAudio/cpal) | Cross-platform audio output |
 | [rustfft](https://github.com/ejmahler/RustFFT) | FFT for spectrum analysis |
 | [crossterm](https://github.com/crossterm-rs/crossterm) | Terminal manipulation |
+| [clap](https://github.com/clap-rs/clap) | CLI argument parsing |
+| [serde](https://github.com/serde-rs/serde) | JSON playlist support |
 | [walkdir](https://github.com/BurntSushi/walkdir) | Directory traversal |
 | [anyhow](https://github.com/dtolnay/anyhow) | Error handling |
 

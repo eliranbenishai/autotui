@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleRate, Stream, StreamConfig};
 use crossterm::{
@@ -17,6 +18,7 @@ use crossterm::{
     ExecutableCommand,
 };
 use rustfft::{num_complex::Complex, FftPlanner};
+use serde::Deserialize;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -25,10 +27,45 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use walkdir::WalkDir;
 
+/// A minimal terminal music player with real-time spectrum visualization
+#[derive(Parser, Debug)]
+#[command(name = "autotui", version, about, long_about = None)]
+struct Args {
+    /// Directory to scan for audio files (supports network paths)
+    #[arg(short, long)]
+    folder: Option<PathBuf>,
+
+    /// Path to a JSON playlist file
+    #[arg(short, long)]
+    playlist: Option<PathBuf>,
+}
+
+/// JSON playlist format
+#[derive(Debug, Deserialize)]
+struct Playlist {
+    /// Optional playlist name (reserved for future use)
+    #[serde(default)]
+    #[allow(dead_code)]
+    name: Option<String>,
+    /// List of track paths
+    tracks: Vec<PlaylistEntry>,
+}
+
+/// A playlist entry can be a simple path string or an object with more details
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PlaylistEntry {
+    /// Simple path string
+    Simple(String),
+    /// Object with path and optional metadata
+    Detailed { path: String },
+}
+
 const NUM_BARS: usize = 16;
 const FFT_SIZE: usize = 1024;
 const BAR_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-const SAMPLE_BUFFER_SIZE: usize = 8192;
+const SAMPLE_BUFFER_SIZE: usize = 88200 * 2; // ~2 seconds at 44.1kHz stereo
+const PREBUFFER_SIZE: usize = 44100; // ~0.5 seconds before starting
 
 struct Track {
     path: PathBuf,
@@ -195,6 +232,8 @@ impl SpectrumAnalyzer {
 const STATE_STOPPED: u8 = 0;
 const STATE_PLAYING: u8 = 1;
 const STATE_PAUSED: u8 = 2;
+const STATE_BUFFERING: u8 = 3;
+const STATE_ERROR: u8 = 4;
 
 struct Player {
     ring_buffer: Arc<Mutex<RingBuffer>>,
@@ -203,6 +242,7 @@ struct Player {
     stop_signal: Arc<AtomicBool>,
     volume: Arc<Mutex<f32>>,
     finished: Arc<AtomicBool>,
+    error_msg: Arc<Mutex<Option<String>>>,
     _stream: Option<Stream>,
     _decoder_handle: Option<thread::JoinHandle<()>>,
 }
@@ -216,6 +256,7 @@ impl Player {
             stop_signal: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(Mutex::new(0.5)),
             finished: Arc::new(AtomicBool::new(false)),
+            error_msg: Arc::new(Mutex::new(None)),
             _stream: None,
             _decoder_handle: None,
         }
@@ -226,6 +267,11 @@ impl Player {
 
         self.stop_signal.store(false, Ordering::SeqCst);
         self.finished.store(false, Ordering::SeqCst);
+        self.state.store(STATE_BUFFERING, Ordering::SeqCst);
+        
+        if let Ok(mut err) = self.error_msg.lock() {
+            *err = None;
+        }
 
         if let Ok(mut rb) = self.ring_buffer.lock() {
             rb.clear();
@@ -268,14 +314,21 @@ impl Player {
         let stop_signal = Arc::clone(&self.stop_signal);
         let state = Arc::clone(&self.state);
         let finished = Arc::clone(&self.finished);
+        let error_msg = Arc::clone(&self.error_msg);
 
         let decoder_handle = thread::spawn(move || {
+            let mut prebuffered = false;
+            let mut decode_errors = 0;
+            
             loop {
                 if stop_signal.load(Ordering::SeqCst) {
                     break;
                 }
 
-                while state.load(Ordering::SeqCst) == STATE_PAUSED {
+                let current_state = state.load(Ordering::SeqCst);
+                
+                // Wait while paused
+                while current_state == STATE_PAUSED {
                     if stop_signal.load(Ordering::SeqCst) {
                         return;
                     }
@@ -284,6 +337,14 @@ impl Player {
 
                 let packet = match format.next_packet() {
                     Ok(p) => p,
+                    Err(symphonia::core::errors::Error::IoError(e)) => {
+                        if let Ok(mut err) = error_msg.lock() {
+                            *err = Some(format!("IO Error: {}", e));
+                        }
+                        state.store(STATE_ERROR, Ordering::SeqCst);
+                        finished.store(true, Ordering::SeqCst);
+                        break;
+                    }
                     Err(_) => {
                         finished.store(true, Ordering::SeqCst);
                         break;
@@ -295,8 +356,22 @@ impl Player {
                 }
 
                 let decoded = match decoder.decode(&packet) {
-                    Ok(d) => d,
-                    Err(_) => continue,
+                    Ok(d) => {
+                        decode_errors = 0;
+                        d
+                    }
+                    Err(e) => {
+                        decode_errors += 1;
+                        if decode_errors > 10 {
+                            if let Ok(mut err) = error_msg.lock() {
+                                *err = Some(format!("Decode error: {}", e));
+                            }
+                            state.store(STATE_ERROR, Ordering::SeqCst);
+                            finished.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        continue;
+                    }
                 };
 
                 let spec = *decoded.spec();
@@ -315,9 +390,16 @@ impl Player {
                     if let Ok(mut rb) = ring_buffer.try_lock() {
                         let written = rb.push(&samples[offset..]);
                         offset += written;
+                        
+                        // Check if we've prebuffered enough to start playing
+                        if !prebuffered && rb.available() >= PREBUFFER_SIZE {
+                            prebuffered = true;
+                            state.store(STATE_PLAYING, Ordering::SeqCst);
+                        }
+                        
                         if written == 0 {
                             drop(rb);
-                            thread::sleep(Duration::from_micros(500));
+                            thread::sleep(Duration::from_millis(1));
                         }
                     } else {
                         thread::sleep(Duration::from_micros(100));
@@ -349,7 +431,7 @@ impl Player {
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let current_state = state.load(Ordering::SeqCst);
 
-                if current_state == STATE_PAUSED || current_state == STATE_STOPPED {
+                if current_state != STATE_PLAYING {
                     data.fill(0.0);
                     return;
                 }
@@ -378,17 +460,22 @@ impl Player {
 
         stream.play()?;
         self._stream = Some(stream);
-        self.state.store(STATE_PLAYING, Ordering::SeqCst);
 
         Ok(())
     }
 
     fn pause(&self) {
-        self.state.store(STATE_PAUSED, Ordering::SeqCst);
+        let current = self.state.load(Ordering::SeqCst);
+        if current == STATE_PLAYING {
+            self.state.store(STATE_PAUSED, Ordering::SeqCst);
+        }
     }
 
     fn resume(&self) {
-        self.state.store(STATE_PLAYING, Ordering::SeqCst);
+        let current = self.state.load(Ordering::SeqCst);
+        if current == STATE_PAUSED {
+            self.state.store(STATE_PLAYING, Ordering::SeqCst);
+        }
     }
 
     fn stop(&mut self) {
@@ -415,6 +502,18 @@ impl Player {
 
     fn state(&self) -> u8 {
         self.state.load(Ordering::SeqCst)
+    }
+
+    fn error(&self) -> Option<String> {
+        self.error_msg.lock().ok().and_then(|e| e.clone())
+    }
+
+    fn buffer_percent(&self) -> u8 {
+        if let Ok(rb) = self.ring_buffer.try_lock() {
+            ((rb.available() as f32 / SAMPLE_BUFFER_SIZE as f32) * 100.0) as u8
+        } else {
+            0
+        }
     }
 
     fn set_volume(&self, vol: f32) {
@@ -478,6 +577,37 @@ impl App {
         }
     }
 
+    fn load_playlist(&mut self, path: &PathBuf) -> Result<()> {
+        self.tracks.clear();
+
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let playlist: Playlist = serde_json::from_reader(reader)?;
+
+        for entry in playlist.tracks {
+            let track_path = match entry {
+                PlaylistEntry::Simple(p) => PathBuf::from(p),
+                PlaylistEntry::Detailed { path: p } => PathBuf::from(p),
+            };
+
+            // Verify file exists and has valid extension
+            if track_path.exists() {
+                if let Some(ext) = track_path.extension() {
+                    let ext_lower = ext.to_string_lossy().to_lowercase();
+                    if matches!(ext_lower.as_str(), "mp3" | "wav" | "flac" | "ogg") {
+                        self.tracks.push(Track::from_path(track_path));
+                    }
+                }
+            }
+        }
+
+        if !self.tracks.is_empty() {
+            self.current_index = 0;
+        }
+
+        Ok(())
+    }
+
     fn play_current(&mut self) {
         if self.tracks.is_empty() {
             return;
@@ -490,7 +620,8 @@ impl App {
         match self.player.state() {
             STATE_PLAYING => self.player.pause(),
             STATE_PAUSED => self.player.resume(),
-            _ => self.play_current(),
+            STATE_ERROR | STATE_STOPPED => self.play_current(),
+            _ => {}
         }
     }
 
@@ -532,7 +663,8 @@ impl App {
     }
 
     fn check_playback(&mut self) {
-        if self.player.state() == STATE_PLAYING && self.player.is_finished() {
+        let state = self.player.state();
+        if (state == STATE_PLAYING || state == STATE_BUFFERING) && self.player.is_finished() {
             self.next_track();
         }
     }
@@ -571,10 +703,14 @@ impl App {
         stdout.execute(MoveToColumn(0))?;
         stdout.execute(Clear(ClearType::CurrentLine))?;
 
-        let state_icon = match self.player.state() {
-            STATE_PLAYING => "▶",
-            STATE_PAUSED => "⏸",
-            _ => "⏹",
+        let state = self.player.state();
+        
+        let (state_icon, state_color) = match state {
+            STATE_PLAYING => ("▶", Color::Green),
+            STATE_PAUSED => ("⏸", Color::Yellow),
+            STATE_BUFFERING => ("◌", Color::Cyan),
+            STATE_ERROR => ("✗", Color::Red),
+            _ => ("⏹", Color::DarkGrey),
         };
 
         let track_name = if !self.tracks.is_empty() {
@@ -600,7 +736,7 @@ impl App {
         stdout.execute(SetForegroundColor(Color::DarkGrey))?;
         stdout.execute(Print("♪ "))?;
 
-        stdout.execute(SetForegroundColor(Color::Cyan))?;
+        stdout.execute(SetForegroundColor(state_color))?;
         stdout.execute(Print(state_icon))?;
         stdout.execute(Print(" "))?;
 
@@ -611,11 +747,30 @@ impl App {
         stdout.execute(SetForegroundColor(Color::White))?;
         stdout.execute(Print(&display_name))?;
 
+        // Show status info
         stdout.execute(SetForegroundColor(Color::DarkGrey))?;
         stdout.execute(Print(" │ "))?;
 
-        stdout.execute(SetForegroundColor(Color::Green))?;
-        stdout.execute(Print(format!("{}%", volume_pct)))?;
+        match state {
+            STATE_BUFFERING => {
+                stdout.execute(SetForegroundColor(Color::Cyan))?;
+                stdout.execute(Print(format!("Buffering {}%", self.player.buffer_percent())))?;
+            }
+            STATE_ERROR => {
+                stdout.execute(SetForegroundColor(Color::Red))?;
+                let err = self.player.error().unwrap_or_else(|| "Error".to_string());
+                let short_err: String = if err.len() > 20 {
+                    format!("{}…", &err[..19])
+                } else {
+                    err
+                };
+                stdout.execute(Print(short_err))?;
+            }
+            _ => {
+                stdout.execute(SetForegroundColor(Color::Green))?;
+                stdout.execute(Print(format!("{}%", volume_pct)))?;
+            }
+        }
 
         stdout.execute(SetForegroundColor(Color::DarkGrey))?;
         if !self.tracks.is_empty() {
@@ -634,11 +789,28 @@ impl App {
 }
 
 fn main() -> Result<()> {
+    let args = Args::parse();
+
     enable_raw_mode()?;
     io::stdout().execute(Hide)?;
 
     let mut app = App::new();
-    app.scan_directory(".");
+
+    // Load tracks based on arguments
+    if let Some(playlist_path) = &args.playlist {
+        if let Err(e) = app.load_playlist(playlist_path) {
+            // Restore terminal before printing error
+            io::stdout().execute(Show)?;
+            disable_raw_mode()?;
+            eprintln!("Error loading playlist: {}", e);
+            return Err(e);
+        }
+    } else if let Some(folder_path) = &args.folder {
+        app.scan_directory(&folder_path.to_string_lossy());
+    } else {
+        // Default: scan current directory
+        app.scan_directory(".");
+    }
 
     if !app.tracks.is_empty() {
         app.play_current();
@@ -669,3 +841,5 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+
