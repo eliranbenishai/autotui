@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{self, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -243,6 +243,9 @@ struct Player {
     volume: Arc<Mutex<f32>>,
     finished: Arc<AtomicBool>,
     error_msg: Arc<Mutex<Option<String>>>,
+    samples_played: Arc<AtomicU32>,
+    sample_rate: Arc<AtomicU32>,
+    total_duration_secs: Arc<AtomicU32>,
     _stream: Option<Stream>,
     _decoder_handle: Option<thread::JoinHandle<()>>,
 }
@@ -257,6 +260,9 @@ impl Player {
             volume: Arc::new(Mutex::new(0.5)),
             finished: Arc::new(AtomicBool::new(false)),
             error_msg: Arc::new(Mutex::new(None)),
+            samples_played: Arc::new(AtomicU32::new(0)),
+            sample_rate: Arc::new(AtomicU32::new(44100)),
+            total_duration_secs: Arc::new(AtomicU32::new(0)),
             _stream: None,
             _decoder_handle: None,
         }
@@ -306,6 +312,16 @@ impl Player {
         let track_id = track.id;
         let sample_rate = codec_params.sample_rate.unwrap_or(44100);
         let channels = codec_params.channels.map(|c| c.count()).unwrap_or(2);
+
+        // Calculate total duration from n_frames if available
+        let total_duration_secs = codec_params.n_frames
+            .map(|frames| (frames / sample_rate as u64) as u32)
+            .unwrap_or(0);
+
+        // Store playback info
+        self.sample_rate.store(sample_rate, Ordering::SeqCst);
+        self.total_duration_secs.store(total_duration_secs, Ordering::SeqCst);
+        self.samples_played.store(0, Ordering::SeqCst);
 
         let mut decoder =
             symphonia::default::get_codecs().make(&codec_params, &DecoderOptions::default())?;
@@ -474,6 +490,8 @@ impl Player {
         let state = Arc::clone(&self.state);
         let volume = Arc::clone(&self.volume);
         let spectrum = Arc::clone(&self.spectrum);
+        let samples_played = Arc::clone(&self.samples_played);
+        let output_channels = config.channels as u32;
 
         let stream = device.build_output_stream(
             &config,
@@ -495,6 +513,10 @@ impl Player {
                     for sample in data.iter_mut().skip(read) {
                         *sample = 0.0;
                     }
+
+                    // Track playback position (samples / channels = frames)
+                    let frames_played = (read as u32) / output_channels.max(1);
+                    samples_played.fetch_add(frames_played, Ordering::SeqCst);
 
                     if let Ok(mut sp) = spectrum.try_lock() {
                         sp.push_samples(&data[..read]);
@@ -576,6 +598,14 @@ impl Player {
 
     fn volume(&self) -> f32 {
         self.volume.try_lock().map(|v| *v).unwrap_or(0.5)
+    }
+
+    fn playback_time(&self) -> (u32, u32) {
+        let sample_rate = self.sample_rate.load(Ordering::SeqCst);
+        let samples = self.samples_played.load(Ordering::SeqCst);
+        let current_secs = if sample_rate > 0 { samples / sample_rate } else { 0 };
+        let total_secs = self.total_duration_secs.load(Ordering::SeqCst);
+        (current_secs, total_secs)
     }
 }
 
@@ -806,6 +836,19 @@ impl App {
 
         stdout.execute(SetForegroundColor(Color::White))?;
         stdout.execute(Print(&display_name))?;
+
+        // Show playback time
+        let (current_secs, total_secs) = self.player.playback_time();
+        if total_secs > 0 || current_secs > 0 {
+            stdout.execute(SetForegroundColor(Color::DarkGrey))?;
+            stdout.execute(Print(" "))?;
+            stdout.execute(SetForegroundColor(Color::Cyan))?;
+            stdout.execute(Print(format!(
+                "{}:{:02}/{}:{:02}",
+                current_secs / 60, current_secs % 60,
+                total_secs / 60, total_secs % 60
+            )))?;
+        }
 
         // Show status info
         stdout.execute(SetForegroundColor(Color::DarkGrey))?;
