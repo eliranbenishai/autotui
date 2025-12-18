@@ -17,6 +17,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
     ExecutableCommand,
 };
+use rubato::{FftFixedInOut, Resampler};
 use rustfft::{num_complex::Complex, FftPlanner};
 use serde::Deserialize;
 use symphonia::core::audio::SampleBuffer;
@@ -244,7 +245,8 @@ struct Player {
     finished: Arc<AtomicBool>,
     error_msg: Arc<Mutex<Option<String>>>,
     samples_played: Arc<AtomicU32>,
-    sample_rate: Arc<AtomicU32>,
+    source_sample_rate: Arc<AtomicU32>,
+    output_sample_rate: Arc<AtomicU32>,
     total_duration_secs: Arc<AtomicU32>,
     _stream: Option<Stream>,
     _decoder_handle: Option<thread::JoinHandle<()>>,
@@ -261,7 +263,8 @@ impl Player {
             finished: Arc::new(AtomicBool::new(false)),
             error_msg: Arc::new(Mutex::new(None)),
             samples_played: Arc::new(AtomicU32::new(0)),
-            sample_rate: Arc::new(AtomicU32::new(44100)),
+            source_sample_rate: Arc::new(AtomicU32::new(44100)),
+            output_sample_rate: Arc::new(AtomicU32::new(44100)),
             total_duration_secs: Arc::new(AtomicU32::new(0)),
             _stream: None,
             _decoder_handle: None,
@@ -318,8 +321,49 @@ impl Player {
             .map(|frames| (frames / sample_rate as u64) as u32)
             .unwrap_or(0);
 
+        // Get output device and determine output sample rate FIRST
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| anyhow::anyhow!("No output device"))?;
+
+        // Try to use the file's sample rate, fall back to device default
+        let desired_config = StreamConfig {
+            channels: channels as u16,
+            sample_rate: SampleRate(sample_rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        // Check if the device supports our desired config, otherwise use default
+        let config = if device.supported_output_configs()
+            .map(|mut configs| {
+                configs.any(|c| {
+                    c.channels() == channels as u16 &&
+                    c.min_sample_rate().0 <= sample_rate &&
+                    c.max_sample_rate().0 >= sample_rate
+                })
+            })
+            .unwrap_or(false)
+        {
+            desired_config
+        } else {
+            // Fall back to device's default config
+            device.default_output_config()
+                .map(|c| StreamConfig {
+                    channels: c.channels(),
+                    sample_rate: c.sample_rate(),
+                    buffer_size: cpal::BufferSize::Default,
+                })
+                .unwrap_or(desired_config)
+        };
+
+        let output_sample_rate = config.sample_rate.0;
+        let output_channels = config.channels as usize;
+        let source_channels = channels;
+
         // Store playback info
-        self.sample_rate.store(sample_rate, Ordering::SeqCst);
+        self.source_sample_rate.store(sample_rate, Ordering::SeqCst);
+        self.output_sample_rate.store(output_sample_rate, Ordering::SeqCst);
         self.total_duration_secs.store(total_duration_secs, Ordering::SeqCst);
         self.samples_played.store(0, Ordering::SeqCst);
 
@@ -332,10 +376,28 @@ impl Player {
         let finished = Arc::clone(&self.finished);
         let error_msg = Arc::clone(&self.error_msg);
 
+        // Spawn decoder thread with resampling support
         let decoder_handle = thread::spawn(move || {
             let mut prebuffered = false;
             let mut decode_errors = 0;
             
+            // Create resampler if sample rates differ
+            let needs_resample = sample_rate != output_sample_rate;
+            let mut resampler: Option<FftFixedInOut<f32>> = if needs_resample {
+                FftFixedInOut::new(
+                    sample_rate as usize,
+                    output_sample_rate as usize,
+                    1024, // chunk size
+                    source_channels,
+                ).ok()
+            } else {
+                None
+            };
+
+            // Buffers for resampling
+            let mut resample_in: Vec<Vec<f32>> = vec![Vec::new(); source_channels];
+            let mut resample_out: Vec<Vec<f32>> = vec![Vec::new(); output_channels];
+
             loop {
                 if stop_signal.load(Ordering::SeqCst) {
                     break;
@@ -354,10 +416,8 @@ impl Player {
                 let packet = match format.next_packet() {
                     Ok(p) => p,
                     Err(symphonia::core::errors::Error::IoError(e)) => {
-                        // Check if it's actually end of stream
                         let err_str = e.to_string();
                         if err_str.contains("end of stream") || e.kind() == std::io::ErrorKind::UnexpectedEof {
-                            // Normal end of file, not an error
                             finished.store(true, Ordering::SeqCst);
                         } else {
                             if let Ok(mut err) = error_msg.lock() {
@@ -377,7 +437,6 @@ impl Player {
                         break;
                     }
                     Err(e) => {
-                        // ResetRequired, SeekError, etc. - likely just end of stream
                         let err_str = e.to_string();
                         if err_str.contains("end of stream") {
                             finished.store(true, Ordering::SeqCst);
@@ -420,19 +479,61 @@ impl Player {
                 let mut sample_buf = SampleBuffer::<f32>::new(duration, spec);
                 sample_buf.copy_interleaved_ref(decoded);
 
-                let samples = sample_buf.samples();
-                let mut offset = 0;
+                let interleaved_samples = sample_buf.samples();
 
-                while offset < samples.len() {
+                // Process samples (with optional resampling)
+                let output_samples: Vec<f32> = if let Some(ref mut resampler) = resampler {
+                    // De-interleave into separate channel buffers
+                    for ch in 0..source_channels {
+                        resample_in[ch].clear();
+                    }
+                    for (i, &sample) in interleaved_samples.iter().enumerate() {
+                        resample_in[i % source_channels].push(sample);
+                    }
+
+                    // Ensure we have enough samples for the resampler
+                    let chunk_size = resampler.input_frames_max();
+                    let mut all_output = Vec::new();
+
+                    while resample_in[0].len() >= chunk_size {
+                        // Take a chunk from each channel
+                        let chunk_in: Vec<Vec<f32>> = resample_in.iter_mut()
+                            .map(|ch| ch.drain(..chunk_size).collect())
+                            .collect();
+
+                        // Prepare output buffers
+                        let out_frames = resampler.output_frames_max();
+                        for ch in 0..output_channels {
+                            resample_out[ch].clear();
+                            resample_out[ch].resize(out_frames, 0.0);
+                        }
+
+                        // Resample
+                        if let Ok((_, out_len)) = resampler.process_into_buffer(&chunk_in, &mut resample_out, None) {
+                            // Re-interleave output
+                            for i in 0..out_len {
+                                for ch in 0..output_channels {
+                                    all_output.push(resample_out[ch][i]);
+                                }
+                            }
+                        }
+                    }
+                    all_output
+                } else {
+                    interleaved_samples.to_vec()
+                };
+
+                // Push to ring buffer
+                let mut offset = 0;
+                while offset < output_samples.len() {
                     if stop_signal.load(Ordering::SeqCst) {
                         return;
                     }
 
                     if let Ok(mut rb) = ring_buffer.try_lock() {
-                        let written = rb.push(&samples[offset..]);
+                        let written = rb.push(&output_samples[offset..]);
                         offset += written;
                         
-                        // Check if we've prebuffered enough to start playing
                         if !prebuffered && rb.available() >= PREBUFFER_SIZE {
                             prebuffered = true;
                             state.store(STATE_PLAYING, Ordering::SeqCst);
@@ -450,41 +551,6 @@ impl Player {
         });
 
         self._decoder_handle = Some(decoder_handle);
-
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| anyhow::anyhow!("No output device"))?;
-
-        // Try to use the file's sample rate, fall back to device default
-        let desired_config = StreamConfig {
-            channels: channels as u16,
-            sample_rate: SampleRate(sample_rate),
-            buffer_size: cpal::BufferSize::Default,
-        };
-
-        // Check if the device supports our desired config, otherwise use default
-        let config = if device.supported_output_configs()
-            .map(|mut configs| {
-                configs.any(|c| {
-                    c.channels() == channels as u16 &&
-                    c.min_sample_rate().0 <= sample_rate &&
-                    c.max_sample_rate().0 >= sample_rate
-                })
-            })
-            .unwrap_or(false)
-        {
-            desired_config
-        } else {
-            // Fall back to device's default config
-            device.default_output_config()
-                .map(|c| StreamConfig {
-                    channels: c.channels(),
-                    sample_rate: c.sample_rate(),
-                    buffer_size: cpal::BufferSize::Default,
-                })
-                .unwrap_or(desired_config)
-        };
 
         let ring_buffer = Arc::clone(&self.ring_buffer);
         let state = Arc::clone(&self.state);
@@ -556,10 +622,22 @@ impl Player {
         self.stop_signal.store(true, Ordering::SeqCst);
         self.state.store(STATE_STOPPED, Ordering::SeqCst);
 
-        self._stream = None;
+        // Drop the stream first to stop audio callback
+        if let Some(stream) = self._stream.take() {
+            drop(stream);
+        }
 
+        // Wait for decoder thread to finish
         if let Some(handle) = self._decoder_handle.take() {
             let _ = handle.join();
+        }
+
+        // Reset playback position
+        self.samples_played.store(0, Ordering::SeqCst);
+        
+        // Clear the buffer
+        if let Ok(mut rb) = self.ring_buffer.lock() {
+            rb.clear();
         }
     }
 
@@ -601,9 +679,10 @@ impl Player {
     }
 
     fn playback_time(&self) -> (u32, u32) {
-        let sample_rate = self.sample_rate.load(Ordering::SeqCst);
+        // Use output sample rate for current time (samples_played is in output frames)
+        let output_rate = self.output_sample_rate.load(Ordering::SeqCst);
         let samples = self.samples_played.load(Ordering::SeqCst);
-        let current_secs = if sample_rate > 0 { samples / sample_rate } else { 0 };
+        let current_secs = if output_rate > 0 { samples / output_rate } else { 0 };
         let total_secs = self.total_duration_secs.load(Ordering::SeqCst);
         (current_secs, total_secs)
     }
