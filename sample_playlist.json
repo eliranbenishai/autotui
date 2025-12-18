@@ -1,0 +1,11 @@
+{
+  "name": "Sample Playlist",
+  "tracks": [
+    "~/Music/song1.mp3",
+    "/absolute/path/to/song2.flac",
+    "./relative/path/song3.wav",
+    { "path": "/another/track.ogg" },
+    { "path": "\\\\server\\share\\network_song.mp3" }
+  ]
+}
+
