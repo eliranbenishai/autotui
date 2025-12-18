@@ -20,7 +20,7 @@ A minimal, single-line terminal music player with real-time spectrum visualizati
 ### From Source
 
 ```bash
-git clone https://github.com/yourusername/autotui
+git clone https://github.com/eliranbenishai/autotui
 cd autotui
 cargo build --release
 ./target/release/autotui

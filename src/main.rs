@@ -64,8 +64,8 @@ enum PlaylistEntry {
 const NUM_BARS: usize = 16;
 const FFT_SIZE: usize = 1024;
 const BAR_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-const SAMPLE_BUFFER_SIZE: usize = 88200 * 2; // ~2 seconds at 44.1kHz stereo
-const PREBUFFER_SIZE: usize = 44100; // ~0.5 seconds before starting
+const SAMPLE_BUFFER_SIZE: usize = 88200 * 4; // ~4 seconds at 44.1kHz stereo
+const PREBUFFER_SIZE: usize = 22050; // ~0.25 seconds before starting
 
 struct Track {
     path: PathBuf,
@@ -415,10 +415,34 @@ impl Player {
             .default_output_device()
             .ok_or_else(|| anyhow::anyhow!("No output device"))?;
 
-        let config = StreamConfig {
+        // Try to use the file's sample rate, fall back to device default
+        let desired_config = StreamConfig {
             channels: channels as u16,
             sample_rate: SampleRate(sample_rate),
             buffer_size: cpal::BufferSize::Default,
+        };
+
+        // Check if the device supports our desired config, otherwise use default
+        let config = if device.supported_output_configs()
+            .map(|mut configs| {
+                configs.any(|c| {
+                    c.channels() == channels as u16 &&
+                    c.min_sample_rate().0 <= sample_rate &&
+                    c.max_sample_rate().0 >= sample_rate
+                })
+            })
+            .unwrap_or(false)
+        {
+            desired_config
+        } else {
+            // Fall back to device's default config
+            device.default_output_config()
+                .map(|c| StreamConfig {
+                    channels: c.channels(),
+                    sample_rate: c.sample_rate(),
+                    buffer_size: cpal::BufferSize::Default,
+                })
+                .unwrap_or(desired_config)
         };
 
         let ring_buffer = Arc::clone(&self.ring_buffer);
@@ -454,7 +478,10 @@ impl Player {
                     data.fill(0.0);
                 }
             },
-            |err| eprintln!("Audio error: {}", err),
+            move |err| {
+                // Log errors but don't crash
+                eprintln!("Audio stream error: {}", err);
+            },
             None,
         )?;
 
@@ -555,17 +582,25 @@ impl App {
     fn scan_directory(&mut self, path: &str) {
         self.tracks.clear();
 
-        for entry in WalkDir::new(path)
+        // Normalize the path: trim quotes and trailing slashes/backslashes
+        let path = path.trim_matches('"').trim_matches('\'');
+        let path = path.trim_end_matches(|c| c == '/' || c == '\\');
+        
+        // Convert to PathBuf and try to canonicalize for better compatibility
+        let scan_path = PathBuf::from(path);
+        let scan_path = scan_path.canonicalize().unwrap_or_else(|_| scan_path);
+
+        for entry in WalkDir::new(&scan_path)
             .follow_links(true)
             .into_iter()
             .filter_map(|e| e.ok())
         {
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(ext) = path.extension() {
+            let file_path = entry.path();
+            if file_path.is_file() {
+                if let Some(ext) = file_path.extension() {
                     let ext_lower = ext.to_string_lossy().to_lowercase();
                     if matches!(ext_lower.as_str(), "mp3" | "wav" | "flac" | "ogg") {
-                        self.tracks.push(Track::from_path(path.to_path_buf()));
+                        self.tracks.push(Track::from_path(file_path.to_path_buf()));
                     }
                 }
             }
@@ -754,7 +789,8 @@ impl App {
         match state {
             STATE_BUFFERING => {
                 stdout.execute(SetForegroundColor(Color::Cyan))?;
-                stdout.execute(Print(format!("Buffering {}%", self.player.buffer_percent())))?;
+                let buf_pct = self.player.buffer_percent();
+                stdout.execute(Print(format!("Buffering {}%", buf_pct)))?;
             }
             STATE_ERROR => {
                 stdout.execute(SetForegroundColor(Color::Red))?;
@@ -765,6 +801,16 @@ impl App {
                     err
                 };
                 stdout.execute(Print(short_err))?;
+            }
+            STATE_PLAYING => {
+                // Show volume and buffer level
+                let buf_pct = self.player.buffer_percent();
+                stdout.execute(SetForegroundColor(Color::Green))?;
+                stdout.execute(Print(format!("{}%", volume_pct)))?;
+                if buf_pct < 50 {
+                    stdout.execute(SetForegroundColor(Color::Yellow))?;
+                    stdout.execute(Print(format!(" buf:{}%", buf_pct)))?;
+                }
             }
             _ => {
                 stdout.execute(SetForegroundColor(Color::Green))?;
