@@ -338,15 +338,40 @@ impl Player {
                 let packet = match format.next_packet() {
                     Ok(p) => p,
                     Err(symphonia::core::errors::Error::IoError(e)) => {
+                        // Check if it's actually end of stream
+                        let err_str = e.to_string();
+                        if err_str.contains("end of stream") || e.kind() == std::io::ErrorKind::UnexpectedEof {
+                            // Normal end of file, not an error
+                            finished.store(true, Ordering::SeqCst);
+                        } else {
+                            if let Ok(mut err) = error_msg.lock() {
+                                *err = Some(format!("IO: {}", err_str));
+                            }
+                            state.store(STATE_ERROR, Ordering::SeqCst);
+                            finished.store(true, Ordering::SeqCst);
+                        }
+                        break;
+                    }
+                    Err(symphonia::core::errors::Error::DecodeError(e)) => {
                         if let Ok(mut err) = error_msg.lock() {
-                            *err = Some(format!("IO Error: {}", e));
+                            *err = Some(format!("Decode: {}", e));
                         }
                         state.store(STATE_ERROR, Ordering::SeqCst);
                         finished.store(true, Ordering::SeqCst);
                         break;
                     }
-                    Err(_) => {
-                        finished.store(true, Ordering::SeqCst);
+                    Err(e) => {
+                        // ResetRequired, SeekError, etc. - likely just end of stream
+                        let err_str = e.to_string();
+                        if err_str.contains("end of stream") {
+                            finished.store(true, Ordering::SeqCst);
+                        } else {
+                            if let Ok(mut err) = error_msg.lock() {
+                                *err = Some(format!("Error: {}", err_str));
+                            }
+                            state.store(STATE_ERROR, Ordering::SeqCst);
+                            finished.store(true, Ordering::SeqCst);
+                        }
                         break;
                     }
                 };
@@ -795,8 +820,8 @@ impl App {
             STATE_ERROR => {
                 stdout.execute(SetForegroundColor(Color::Red))?;
                 let err = self.player.error().unwrap_or_else(|| "Error".to_string());
-                let short_err: String = if err.len() > 20 {
-                    format!("{}…", &err[..19])
+                let short_err: String = if err.len() > 40 {
+                    format!("{}…", &err[..39])
                 } else {
                     err
                 };
