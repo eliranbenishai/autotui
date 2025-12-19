@@ -75,11 +75,13 @@ Tracks can be simple path strings or objects with a `path` field. Both local and
 |----------|-------|-------------|
 | `<PATH>` | | Folder, playlist (.json), or audio file to play |
 | `--shuffle` | `-s` | Shuffle the playlist or folder of files |
+| `--recursive` | `-r` | Scan directories recursively |
+| `--write <FILE>` | `-w` | Write playlist to file and exit |
 | `--help` | `-h` | Print help information |
 | `--version` | `-V` | Print version |
 
 The path type is automatically detected:
-- **Directory** → scans for audio files
+- **Directory** → scans for audio files (use `-r` for subdirectories)
 - **`.json` file** → loads as playlist
 - **Audio file** → plays single track
 
@@ -87,13 +89,13 @@ The path type is automatically detected:
 
 ```bash
 autotui                              # Scan current directory
-autotui ~/Music                      # Play all tracks in folder
+autotui ~/Music                      # Play tracks in folder
+autotui ~/Music -r                   # Play tracks recursively
 autotui playlist.json                # Load JSON playlist
 autotui song.mp3                     # Play single track
 autotui ~/Music -s                   # Play folder shuffled
-autotui playlist.json -s             # Play playlist shuffled
-autotui "\\server\share\music"       # Windows network path
-autotui /Volumes/NAS/Music           # macOS network mount
+autotui ~/Music -rs                  # Recursive + shuffled
+autotui -r ~/Music -w library.json   # Save recursive scan to playlist
 ```
 
 ## Controls
@@ -110,6 +112,7 @@ autotui /Volumes/NAS/Music           # macOS network mount
 | `↑` `+` | Volume up |
 | `↓` `-` | Volume down |
 | `r` | Rescan current directory |
+| `w` | Save playlist to `playlist.json` |
 | `q` `Esc` | Quit |
 
 ## Building

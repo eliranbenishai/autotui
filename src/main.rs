@@ -19,7 +19,7 @@ use crossterm::{
 };
 use rubato::{SincFixedIn, SincInterpolationType, SincInterpolationParameters, Resampler, WindowFunction};
 use rustfft::{num_complex::Complex, FftPlanner};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -38,12 +38,20 @@ struct Args {
     #[arg(short, long)]
     shuffle: bool,
 
+    /// Scan directories recursively
+    #[arg(short, long)]
+    recursive: bool,
+
+    /// Write playlist to file and exit (utility mode)
+    #[arg(short, long, value_name = "FILE")]
+    write: Option<PathBuf>,
+
     /// Path to folder, playlist (.json), or audio file
     #[arg(value_name = "PATH")]
     path: Option<PathBuf>,
 }
 
-/// JSON playlist format
+/// JSON playlist format (for reading)
 #[derive(Debug, Deserialize)]
 struct Playlist {
     /// Optional playlist name (reserved for future use)
@@ -52,6 +60,12 @@ struct Playlist {
     name: Option<String>,
     /// List of track paths
     tracks: Vec<PlaylistEntry>,
+}
+
+/// Simple playlist format (for writing)
+#[derive(Debug, Serialize)]
+struct PlaylistOutput {
+    tracks: Vec<String>,
 }
 
 /// A playlist entry can be a simple path string or an object with more details
@@ -756,6 +770,7 @@ struct App {
     player: Player,
     last_update: Instant,
     shuffle: bool,
+    recursive: bool,
 }
 
 impl App {
@@ -768,10 +783,20 @@ impl App {
             player: Player::new(),
             last_update: Instant::now(),
             shuffle: false,
+            recursive: false,
         }
     }
 
-    fn scan_directory(&mut self, path: &str) {
+    fn save_playlist(&self, path: &PathBuf) -> Result<()> {
+        let playlist = PlaylistOutput {
+            tracks: self.tracks.iter().map(|t| t.path.to_string_lossy().to_string()).collect(),
+        };
+        let json = serde_json::to_string_pretty(&playlist)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    fn scan_directory(&mut self, path: &str, recursive: bool) {
         self.tracks.clear();
 
         // Normalize the path: trim quotes and trailing slashes/backslashes
@@ -782,11 +807,13 @@ impl App {
         let scan_path = PathBuf::from(path);
         let scan_path = scan_path.canonicalize().unwrap_or_else(|_| scan_path);
 
-        for entry in WalkDir::new(&scan_path)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+        let walker = if recursive {
+            WalkDir::new(&scan_path).follow_links(true)
+        } else {
+            WalkDir::new(&scan_path).follow_links(true).max_depth(1)
+        };
+
+        for entry in walker.into_iter().filter_map(|e| e.ok()) {
             let file_path = entry.path();
             if file_path.is_file() {
                 if let Some(ext) = file_path.extension() {
@@ -960,7 +987,8 @@ impl App {
             KeyCode::Char('p') => self.prev_track(),
             KeyCode::Up | KeyCode::Char('+') | KeyCode::Char('=') => self.set_volume(0.05),
             KeyCode::Down | KeyCode::Char('-') | KeyCode::Char('_') => self.set_volume(-0.05),
-            KeyCode::Char('r') => self.scan_directory("."),
+            KeyCode::Char('r') => self.scan_directory(".", self.recursive),
+            KeyCode::Char('w') => { let _ = self.save_playlist(&PathBuf::from("playlist.json")); }
             _ => {}
         }
     }
@@ -1090,24 +1118,20 @@ impl App {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    enable_raw_mode()?;
-    io::stdout().execute(Hide)?;
-
     let mut app = App::new();
+    app.recursive = args.recursive;
 
     // Load tracks based on arguments - infer type from path
     if let Some(path) = &args.path {
         if path.is_dir() {
             // Directory: scan for audio files
-            app.scan_directory(&path.to_string_lossy());
+            app.scan_directory(&path.to_string_lossy(), args.recursive);
         } else if path.is_file() {
             if let Some(ext) = path.extension() {
                 let ext_lower = ext.to_string_lossy().to_lowercase();
                 if ext_lower == "json" {
                     // JSON file: treat as playlist
                     if let Err(e) = app.load_playlist(path) {
-                        io::stdout().execute(Show)?;
-                        disable_raw_mode()?;
                         eprintln!("Error loading playlist: {}", e);
                         return Err(e);
                     }
@@ -1115,21 +1139,17 @@ fn main() -> Result<()> {
                     // Audio file: add as single track
                     app.tracks.push(Track::from_path(path.clone()));
                 } else {
-                    io::stdout().execute(Show)?;
-                    disable_raw_mode()?;
                     eprintln!("Unsupported file type: {}", ext_lower);
                     return Ok(());
                 }
             }
         } else {
-            io::stdout().execute(Show)?;
-            disable_raw_mode()?;
             eprintln!("Path not found: {}", path.display());
             return Ok(());
         }
     } else {
         // Default: scan current directory
-        app.scan_directory(".");
+        app.scan_directory(".", args.recursive);
     }
 
     // Shuffle tracks if requested via CLI
@@ -1138,6 +1158,28 @@ fn main() -> Result<()> {
         let mut rng = thread_rng();
         app.tracks.shuffle(&mut rng);
     }
+
+    // Write mode: save playlist and exit
+    if let Some(output_path) = &args.write {
+        if app.tracks.is_empty() {
+            eprintln!("No tracks found to save");
+            return Ok(());
+        }
+        match app.save_playlist(output_path) {
+            Ok(()) => {
+                println!("Saved {} tracks to {}", app.tracks.len(), output_path.display());
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Error saving playlist: {}", e);
+                return Err(e);
+            }
+        }
+    }
+
+    // Normal playback mode
+    enable_raw_mode()?;
+    io::stdout().execute(Hide)?;
 
     if !app.tracks.is_empty() {
         app.play_current();
@@ -1168,5 +1210,6 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
 
 
