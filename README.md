@@ -1,9 +1,9 @@
 # autotui 🎵
 
 A minimal, single-line terminal music player with real-time spectrum visualization.
-Perfect for its own terminal tab in VSCode / Zed / Cursor / Antigravity, minding
-its own business and not feeding the monster that consumes musicians and 
-creativity -- Spotify.
+Perfect for (but not limited to) its own terminal tab in VSCode / Zed / Cursor / 
+Antigravity, minding its own business and not feeding the monster that consumes 
+musicians and creativity -- Spotify.
 
 ```
 ♪ ▶ ▃▅▇█▆▄▃▅▆█▇▅▃▂▁▃ Adoring Light 2:34/4:12 │ 75% │ 3/12 🔀
