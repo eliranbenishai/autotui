@@ -75,20 +75,22 @@ Tracks can be simple path strings or objects with a `path` field. Both local and
 |----------|-------|-------------|
 | `--folder <PATH>` | `-f` | Directory to scan for audio files (supports network paths) |
 | `--playlist <PATH>` | `-p` | Path to a JSON playlist file |
-| `--shuffle` | `-s` | Shuffle the playlist or folder of files |
+| `--shuffle` | `-S` | Shuffle the playlist or folder of files |
 | `--help` | `-h` | Print help information |
 | `--version` | `-V` | Print version |
+| `<PATH>` | | Positional path to scan (alternative to `-f`) |
 
 **Examples:**
 
 ```bash
 autotui                              # Scan current directory
-autotui -f ~/Music                   # Scan specific folder
+autotui ~/Music                      # Plays all tracks in current folder
+autotui -f ~/Music                   # Plays all tracks in specific folder (flag)
 autotui -f "\\server\share\music"   # Windows network path
 autotui -f /Volumes/NAS/Music        # macOS network mount
 autotui -p playlist.json             # Load JSON playlist
-autotui -s                           # Shuffle tracks
-autotui -f ~/Music -s                # Scan folder and shuffle
+autotui -S                           # Shuffle tracks
+autotui ~/Music -S                   # Play folder and shuffle
 autotui -p playlist.json --shuffle   # Load playlist and shuffle
 autotui --help                       # Show help
 autotui --version                    # Show version

@@ -43,8 +43,12 @@ struct Args {
     playlist: Option<PathBuf>,
 
     /// Shuffle the playlist or folder of files
-    #[arg(short, long)]
+    #[arg(short = 'S', long)]
     shuffle: bool,
+
+    /// Directory to scan (positional argument, alternative to -f)
+    #[arg(value_name = "PATH")]
+    path: Option<PathBuf>,
 }
 
 /// JSON playlist format
@@ -1109,7 +1113,8 @@ fn main() -> Result<()> {
             eprintln!("Error loading playlist: {}", e);
             return Err(e);
         }
-    } else if let Some(folder_path) = &args.folder {
+    } else if let Some(folder_path) = args.folder.as_ref().or(args.path.as_ref()) {
+        // Support both -f/--folder and positional path argument
         app.scan_directory(&folder_path.to_string_lossy());
     } else {
         // Default: scan current directory
