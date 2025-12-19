@@ -190,8 +190,10 @@ impl SpectrumAnalyzer {
         let bin_count = FFT_SIZE / 2;
 
         for (band_idx, band) in self.bands.iter_mut().enumerate() {
-            let freq_low = 20.0 * (1000.0_f32).powf(band_idx as f32 / NUM_BARS as f32);
-            let freq_high = 20.0 * (1000.0_f32).powf((band_idx + 1) as f32 / NUM_BARS as f32);
+            // Map bands from 30 Hz to 8000 Hz (log scale) for better music visualization
+            // Most music energy is in bass/mids, so we cap at 8kHz instead of 20kHz
+            let freq_low = 30.0 * (266.7_f32).powf(band_idx as f32 / NUM_BARS as f32);
+            let freq_high = 30.0 * (266.7_f32).powf((band_idx + 1) as f32 / NUM_BARS as f32);
 
             let bin_low = ((freq_low / 22050.0) * bin_count as f32) as usize;
             let bin_high = ((freq_high / 22050.0) * bin_count as f32) as usize;
@@ -754,8 +756,10 @@ struct App {
     should_quit: bool,
     tracks: Vec<Track>,
     current_index: usize,
+    playing_index: Option<usize>, // Track which index is actually playing
     player: Player,
     last_update: Instant,
+    shuffle: bool,
 }
 
 impl App {
@@ -764,8 +768,10 @@ impl App {
             should_quit: false,
             tracks: Vec::new(),
             current_index: 0,
+            playing_index: None,
             player: Player::new(),
             last_update: Instant::now(),
+            shuffle: false,
         }
     }
 
@@ -839,12 +845,20 @@ impl App {
         }
         let track = &self.tracks[self.current_index];
         let _ = self.player.play(&track.path);
+        self.playing_index = Some(self.current_index);
     }
 
     fn toggle_pause(&mut self) {
         match self.player.state() {
             STATE_PLAYING => self.player.pause(),
-            STATE_PAUSED => self.player.resume(),
+            STATE_PAUSED => {
+                // If the selected track changed while paused, play the new track
+                if self.playing_index != Some(self.current_index) {
+                    self.play_current();
+                } else {
+                    self.player.resume();
+                }
+            }
             STATE_ERROR | STATE_STOPPED => self.play_current(),
             _ => {}
         }
@@ -852,6 +866,7 @@ impl App {
 
     fn stop(&mut self) {
         self.player.stop();
+        self.playing_index = None;
     }
 
     fn set_volume(&mut self, delta: f32) {
@@ -863,18 +878,28 @@ impl App {
         if self.tracks.is_empty() {
             return;
         }
+        let was_playing = self.player.state() == STATE_PLAYING || self.player.state() == STATE_BUFFERING;
         self.current_index = if self.current_index == 0 {
             self.tracks.len() - 1
         } else {
             self.current_index - 1
         };
+        // If playing, immediately switch to the new track
+        if was_playing {
+            self.play_current();
+        }
     }
 
     fn select_next(&mut self) {
         if self.tracks.is_empty() {
             return;
         }
+        let was_playing = self.player.state() == STATE_PLAYING || self.player.state() == STATE_BUFFERING;
         self.current_index = (self.current_index + 1) % self.tracks.len();
+        // If playing, immediately switch to the new track
+        if was_playing {
+            self.play_current();
+        }
     }
 
     fn next_track(&mut self) {
@@ -891,6 +916,28 @@ impl App {
         let state = self.player.state();
         if (state == STATE_PLAYING || state == STATE_BUFFERING) && self.player.is_finished() {
             self.next_track();
+        }
+    }
+
+    fn toggle_shuffle(&mut self) {
+        self.shuffle = !self.shuffle;
+        if self.shuffle && self.tracks.len() > 1 {
+            // Shuffle remaining tracks (keep current track, shuffle the rest)
+            let current_path = if !self.tracks.is_empty() {
+                Some(self.tracks[self.current_index].path.clone())
+            } else {
+                None
+            };
+            
+            let mut rng = thread_rng();
+            self.tracks.shuffle(&mut rng);
+            
+            // Find and move current track back to current_index position
+            if let Some(path) = current_path {
+                if let Some(pos) = self.tracks.iter().position(|t| t.path == path) {
+                    self.tracks.swap(self.current_index, pos);
+                }
+            }
         }
     }
 
@@ -913,6 +960,7 @@ impl App {
             KeyCode::Enter => self.play_current(),
             KeyCode::Char(' ') => self.toggle_pause(),
             KeyCode::Char('s') => self.stop(),
+            KeyCode::Char('S') => self.toggle_shuffle(),
             KeyCode::Char('n') => self.next_track(),
             KeyCode::Char('p') => self.prev_track(),
             KeyCode::Up | KeyCode::Char('+') | KeyCode::Char('=') => self.set_volume(0.05),
@@ -1030,6 +1078,13 @@ impl App {
             )))?;
         }
 
+        // Show shuffle indicator
+        if self.shuffle {
+            stdout.execute(Print(" "))?;
+            stdout.execute(SetForegroundColor(Color::Cyan))?;
+            stdout.execute(Print("🔀"))?;
+        }
+
         stdout.execute(ResetColor)?;
         stdout.flush()?;
 
@@ -1061,8 +1116,9 @@ fn main() -> Result<()> {
         app.scan_directory(".");
     }
 
-    // Shuffle tracks if requested
+    // Shuffle tracks if requested via CLI
     if args.shuffle {
+        app.shuffle = true;
         let mut rng = thread_rng();
         app.tracks.shuffle(&mut rng);
     }

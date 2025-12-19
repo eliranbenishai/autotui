@@ -101,6 +101,7 @@ autotui --version                    # Show version
 | `Space` | Play / Pause |
 | `Enter` | Play selected track |
 | `s` | Stop |
+| `S` | Toggle shuffle 🔀 |
 | `n` | Next track |
 | `p` | Previous track |
 | `←` `h` | Select previous |
