@@ -73,27 +73,27 @@ Tracks can be simple path strings or objects with a `path` field. Both local and
 
 | Argument | Short | Description |
 |----------|-------|-------------|
-| `--folder <PATH>` | `-f` | Directory to scan for audio files (supports network paths) |
-| `--playlist <PATH>` | `-p` | Path to a JSON playlist file |
-| `--shuffle` | `-S` | Shuffle the playlist or folder of files |
+| `<PATH>` | | Folder, playlist (.json), or audio file to play |
+| `--shuffle` | `-s` | Shuffle the playlist or folder of files |
 | `--help` | `-h` | Print help information |
 | `--version` | `-V` | Print version |
-| `<PATH>` | | Positional path to scan (alternative to `-f`) |
+
+The path type is automatically detected:
+- **Directory** → scans for audio files
+- **`.json` file** → loads as playlist
+- **Audio file** → plays single track
 
 **Examples:**
 
 ```bash
 autotui                              # Scan current directory
-autotui ~/Music                      # Plays all tracks in current folder
-autotui -f ~/Music                   # Plays all tracks in specific folder (flag)
-autotui -f "\\server\share\music"   # Windows network path
-autotui -f /Volumes/NAS/Music        # macOS network mount
-autotui -p playlist.json             # Load JSON playlist
-autotui -S                           # Shuffle tracks
-autotui ~/Music -S                   # Play folder and shuffle
-autotui -p playlist.json --shuffle   # Load playlist and shuffle
-autotui --help                       # Show help
-autotui --version                    # Show version
+autotui ~/Music                      # Play all tracks in folder
+autotui playlist.json                # Load JSON playlist
+autotui song.mp3                     # Play single track
+autotui ~/Music -s                   # Play folder shuffled
+autotui playlist.json -s             # Play playlist shuffled
+autotui "\\server\share\music"       # Windows network path
+autotui /Volumes/NAS/Music           # macOS network mount
 ```
 
 ## Controls
@@ -102,15 +102,14 @@ autotui --version                    # Show version
 |-----|--------|
 | `Space` | Play / Pause |
 | `Enter` | Play selected track |
-| `s` | Stop |
-| `S` | Toggle shuffle 🔀 |
+| `s` | Toggle shuffle 🔀 |
 | `n` | Next track |
 | `p` | Previous track |
 | `←` `h` | Select previous |
 | `→` `l` | Select next |
 | `↑` `+` | Volume up |
 | `↓` `-` | Volume down |
-| `o` | Rescan current directory |
+| `r` | Rescan current directory |
 | `q` `Esc` | Quit |
 
 ## Building

@@ -34,19 +34,11 @@ use walkdir::WalkDir;
 #[derive(Parser, Debug)]
 #[command(name = "autotui", version, about, long_about = None)]
 struct Args {
-    /// Directory to scan for audio files (supports network paths)
-    #[arg(short, long)]
-    folder: Option<PathBuf>,
-
-    /// Path to a JSON playlist file
-    #[arg(short, long)]
-    playlist: Option<PathBuf>,
-
     /// Shuffle the playlist or folder of files
-    #[arg(short = 'S', long)]
+    #[arg(short, long)]
     shuffle: bool,
 
-    /// Directory to scan (positional argument, alternative to -f)
+    /// Path to folder, playlist (.json), or audio file
     #[arg(value_name = "PATH")]
     path: Option<PathBuf>,
 }
@@ -963,13 +955,12 @@ impl App {
             KeyCode::Right | KeyCode::Char('l') => self.select_next(),
             KeyCode::Enter => self.play_current(),
             KeyCode::Char(' ') => self.toggle_pause(),
-            KeyCode::Char('s') => self.stop(),
-            KeyCode::Char('S') => self.toggle_shuffle(),
+            KeyCode::Char('s') => self.toggle_shuffle(),
             KeyCode::Char('n') => self.next_track(),
             KeyCode::Char('p') => self.prev_track(),
             KeyCode::Up | KeyCode::Char('+') | KeyCode::Char('=') => self.set_volume(0.05),
             KeyCode::Down | KeyCode::Char('-') | KeyCode::Char('_') => self.set_volume(-0.05),
-            KeyCode::Char('o') => self.scan_directory("."),
+            KeyCode::Char('r') => self.scan_directory("."),
             _ => {}
         }
     }
@@ -1104,18 +1095,38 @@ fn main() -> Result<()> {
 
     let mut app = App::new();
 
-    // Load tracks based on arguments
-    if let Some(playlist_path) = &args.playlist {
-        if let Err(e) = app.load_playlist(playlist_path) {
-            // Restore terminal before printing error
+    // Load tracks based on arguments - infer type from path
+    if let Some(path) = &args.path {
+        if path.is_dir() {
+            // Directory: scan for audio files
+            app.scan_directory(&path.to_string_lossy());
+        } else if path.is_file() {
+            if let Some(ext) = path.extension() {
+                let ext_lower = ext.to_string_lossy().to_lowercase();
+                if ext_lower == "json" {
+                    // JSON file: treat as playlist
+                    if let Err(e) = app.load_playlist(path) {
+                        io::stdout().execute(Show)?;
+                        disable_raw_mode()?;
+                        eprintln!("Error loading playlist: {}", e);
+                        return Err(e);
+                    }
+                } else if matches!(ext_lower.as_str(), "mp3" | "wav" | "flac" | "ogg") {
+                    // Audio file: add as single track
+                    app.tracks.push(Track::from_path(path.clone()));
+                } else {
+                    io::stdout().execute(Show)?;
+                    disable_raw_mode()?;
+                    eprintln!("Unsupported file type: {}", ext_lower);
+                    return Ok(());
+                }
+            }
+        } else {
             io::stdout().execute(Show)?;
             disable_raw_mode()?;
-            eprintln!("Error loading playlist: {}", e);
-            return Err(e);
+            eprintln!("Path not found: {}", path.display());
+            return Ok(());
         }
-    } else if let Some(folder_path) = args.folder.as_ref().or(args.path.as_ref()) {
-        // Support both -f/--folder and positional path argument
-        app.scan_directory(&folder_path.to_string_lossy());
     } else {
         // Default: scan current directory
         app.scan_directory(".");
