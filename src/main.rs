@@ -17,7 +17,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
     ExecutableCommand,
 };
-use rubato::{FftFixedInOut, Resampler};
+use rubato::{SincFixedIn, SincInterpolationType, SincInterpolationParameters, Resampler, WindowFunction};
 use rustfft::{num_complex::Complex, FftPlanner};
 use serde::Deserialize;
 use symphonia::core::audio::SampleBuffer;
@@ -26,6 +26,8 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use rand::seq::SliceRandom;
+use rand::thread_rng;
 use walkdir::WalkDir;
 
 /// A minimal terminal music player with real-time spectrum visualization
@@ -39,6 +41,10 @@ struct Args {
     /// Path to a JSON playlist file
     #[arg(short, long)]
     playlist: Option<PathBuf>,
+
+    /// Shuffle the playlist or folder of files
+    #[arg(short, long)]
+    shuffle: bool,
 }
 
 /// JSON playlist format
@@ -65,8 +71,8 @@ enum PlaylistEntry {
 const NUM_BARS: usize = 16;
 const FFT_SIZE: usize = 1024;
 const BAR_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-const SAMPLE_BUFFER_SIZE: usize = 88200 * 4; // ~4 seconds at 44.1kHz stereo
-const PREBUFFER_SIZE: usize = 22050; // ~0.25 seconds before starting
+const SAMPLE_BUFFER_SIZE: usize = 88200 * 8; // ~8 seconds at 44.1kHz stereo
+const PREBUFFER_SIZE: usize = 44100;         // ~0.5 seconds before starting (reduces crackling)
 
 struct Track {
     path: PathBuf,
@@ -383,20 +389,56 @@ impl Player {
             
             // Create resampler if sample rates differ
             let needs_resample = sample_rate != output_sample_rate;
-            let mut resampler: Option<FftFixedInOut<f32>> = if needs_resample {
-                FftFixedInOut::new(
-                    sample_rate as usize,
-                    output_sample_rate as usize,
-                    1024, // chunk size
+            let resample_ratio = output_sample_rate as f64 / sample_rate as f64;
+            
+            let mut resampler: Option<SincFixedIn<f32>> = if needs_resample {
+                // Try with quality settings first
+                let params = SincInterpolationParameters {
+                    sinc_len: 64,
+                    f_cutoff: 0.925,
+                    interpolation: SincInterpolationType::Linear,
+                    oversampling_factor: 128,
+                    window: WindowFunction::Blackman,
+                };
+                SincFixedIn::new(
+                    resample_ratio,
+                    2.0,
+                    params,
+                    512,
                     source_channels,
-                ).ok()
+                ).or_else(|_| {
+                    // Fallback to simpler settings if first attempt fails
+                    let simple_params = SincInterpolationParameters {
+                        sinc_len: 32,
+                        f_cutoff: 0.9,
+                        interpolation: SincInterpolationType::Nearest,
+                        oversampling_factor: 64,
+                        window: WindowFunction::Hann,
+                    };
+                    SincFixedIn::new(
+                        resample_ratio,
+                        2.0,
+                        simple_params,
+                        256,
+                        source_channels,
+                    )
+                }).ok()
             } else {
                 None
             };
+            
+            // If resampling is needed but resampler failed, signal an error
+            if needs_resample && resampler.is_none() {
+                if let Ok(mut err) = error_msg.lock() {
+                    *err = Some(format!("Resampler init failed ({}Hz -> {}Hz)", sample_rate, output_sample_rate));
+                }
+                state.store(STATE_ERROR, Ordering::SeqCst);
+                finished.store(true, Ordering::SeqCst);
+                return;
+            }
 
-            // Buffers for resampling
+            // Buffers for resampling (same channels in and out - resampler doesn't change channel count)
             let mut resample_in: Vec<Vec<f32>> = vec![Vec::new(); source_channels];
-            let mut resample_out: Vec<Vec<f32>> = vec![Vec::new(); output_channels];
 
             loop {
                 if stop_signal.load(Ordering::SeqCst) {
@@ -482,16 +524,13 @@ impl Player {
                 let interleaved_samples = sample_buf.samples();
 
                 // Process samples (with optional resampling)
-                let output_samples: Vec<f32> = if let Some(ref mut resampler) = resampler {
-                    // De-interleave into separate channel buffers
-                    for ch in 0..source_channels {
-                        resample_in[ch].clear();
-                    }
+                let resampled_samples: Vec<f32> = if let Some(ref mut resampler) = resampler {
+                    // De-interleave into separate channel buffers (accumulate)
                     for (i, &sample) in interleaved_samples.iter().enumerate() {
                         resample_in[i % source_channels].push(sample);
                     }
 
-                    // Ensure we have enough samples for the resampler
+                    // Process complete chunks through resampler
                     let chunk_size = resampler.input_frames_max();
                     let mut all_output = Vec::new();
 
@@ -501,26 +540,43 @@ impl Player {
                             .map(|ch| ch.drain(..chunk_size).collect())
                             .collect();
 
-                        // Prepare output buffers
-                        let out_frames = resampler.output_frames_max();
-                        for ch in 0..output_channels {
-                            resample_out[ch].clear();
-                            resample_out[ch].resize(out_frames, 0.0);
-                        }
-
-                        // Resample
-                        if let Ok((_, out_len)) = resampler.process_into_buffer(&chunk_in, &mut resample_out, None) {
-                            // Re-interleave output
-                            for i in 0..out_len {
-                                for ch in 0..output_channels {
-                                    all_output.push(resample_out[ch][i]);
+                        // Resample - SincFixedIn returns Vec<Vec<f32>>
+                        match resampler.process(&chunk_in, None) {
+                            Ok(resampled) => {
+                                // Re-interleave output (channel count stays the same as source)
+                                if !resampled.is_empty() && !resampled[0].is_empty() {
+                                    let out_len = resampled[0].len();
+                                    for i in 0..out_len {
+                                        for ch in 0..source_channels {
+                                            all_output.push(resampled[ch][i]);
+                                        }
+                                    }
                                 }
+                            }
+                            Err(_) => {
+                                // On error, skip this chunk
                             }
                         }
                     }
                     all_output
                 } else {
                     interleaved_samples.to_vec()
+                };
+
+                // Convert channels if needed (source_channels -> output_channels)
+                let output_samples: Vec<f32> = if source_channels == output_channels {
+                    resampled_samples
+                } else if source_channels == 1 && output_channels == 2 {
+                    // Mono to stereo: duplicate each sample
+                    resampled_samples.iter().flat_map(|&s| [s, s]).collect()
+                } else if source_channels == 2 && output_channels == 1 {
+                    // Stereo to mono: average pairs
+                    resampled_samples.chunks(2)
+                        .map(|pair| (pair.get(0).unwrap_or(&0.0) + pair.get(1).unwrap_or(&0.0)) * 0.5)
+                        .collect()
+                } else {
+                    // For other conversions, just use what we have (may not be ideal)
+                    resampled_samples
                 };
 
                 // Push to ring buffer
@@ -1003,6 +1059,12 @@ fn main() -> Result<()> {
     } else {
         // Default: scan current directory
         app.scan_directory(".");
+    }
+
+    // Shuffle tracks if requested
+    if args.shuffle {
+        let mut rng = thread_rng();
+        app.tracks.shuffle(&mut rng);
     }
 
     if !app.tracks.is_empty() {
