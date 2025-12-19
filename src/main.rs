@@ -1123,29 +1123,40 @@ fn main() -> Result<()> {
 
     // Load tracks based on arguments - infer type from path
     if let Some(path) = &args.path {
-        if path.is_dir() {
+        // Normalize path for Windows compatibility
+        let path_str = path.to_string_lossy();
+        let path_str = path_str.trim_matches('"').trim_matches('\'');
+        let path_str = path_str.trim_end_matches(|c| c == '/' || c == '\\');
+        let normalized_path = PathBuf::from(path_str);
+        let canonical_path = normalized_path.canonicalize().unwrap_or(normalized_path.clone());
+        
+        if canonical_path.is_dir() {
             // Directory: scan for audio files
-            app.scan_directory(&path.to_string_lossy(), args.recursive);
-        } else if path.is_file() {
-            if let Some(ext) = path.extension() {
+            app.scan_directory(&canonical_path.to_string_lossy(), args.recursive);
+        } else if canonical_path.is_file() {
+            if let Some(ext) = canonical_path.extension() {
                 let ext_lower = ext.to_string_lossy().to_lowercase();
                 if ext_lower == "json" {
                     // JSON file: treat as playlist
-                    if let Err(e) = app.load_playlist(path) {
+                    if let Err(e) = app.load_playlist(&canonical_path) {
                         eprintln!("Error loading playlist: {}", e);
                         return Err(e);
                     }
                 } else if matches!(ext_lower.as_str(), "mp3" | "wav" | "flac" | "ogg") {
                     // Audio file: add as single track
-                    app.tracks.push(Track::from_path(path.clone()));
+                    app.tracks.push(Track::from_path(canonical_path.clone()));
                 } else {
                     eprintln!("Unsupported file type: {}", ext_lower);
                     return Ok(());
                 }
             }
         } else {
-            eprintln!("Path not found: {}", path.display());
-            return Ok(());
+            // Try as directory anyway (might work with network paths)
+            app.scan_directory(&path_str, args.recursive);
+            if app.tracks.is_empty() {
+                eprintln!("Path not found or no tracks: {}", path.display());
+                return Ok(());
+            }
         }
     } else {
         // Default: scan current directory
