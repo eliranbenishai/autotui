@@ -1148,7 +1148,7 @@ fn main() -> Result<()> {
     io::stdout().execute(Show)?;
     disable_raw_mode()?;
 
-    println!("Goodbye!");
+    println!("Enjoy the silence!");
 
     Ok(())
 }

@@ -132,35 +132,6 @@ brew install mingw-w64
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-## Releasing
-
-Create a new release with one command:
-
-```bash
-./release.sh 0.2.0
-# or
-make release V=0.2.0
-```
-
-This will:
-1. Update version in `Cargo.toml`
-2. Commit the version bump
-3. Create and push a git tag
-4. Trigger GitHub Actions to build binaries for all platforms
-
-## Dependencies
-
-| Crate | Purpose |
-|-------|---------|
-| [symphonia](https://github.com/pdeljanov/Symphonia) | Audio decoding |
-| [cpal](https://github.com/RustAudio/cpal) | Cross-platform audio output |
-| [rustfft](https://github.com/ejmahler/RustFFT) | FFT for spectrum analysis |
-| [crossterm](https://github.com/crossterm-rs/crossterm) | Terminal manipulation |
-| [clap](https://github.com/clap-rs/clap) | CLI argument parsing |
-| [serde](https://github.com/serde-rs/serde) | JSON playlist support |
-| [walkdir](https://github.com/BurntSushi/walkdir) | Directory traversal |
-| [anyhow](https://github.com/dtolnay/anyhow) | Error handling |
-
 ## License
 
 MIT
