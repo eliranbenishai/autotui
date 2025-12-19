@@ -1,2 +1,5 @@
 /target
 *.mp3
+release.sh
+.vscode
+.DS_Store
